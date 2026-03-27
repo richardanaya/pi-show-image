@@ -1,11 +1,13 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import terminalImage from "terminal-image";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFile, writeFile, mkdtemp, unlink } from "node:fs/promises";
+import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
 
 // Store pending images to display after the next assistant message completes
 const pendingImages: string[] = [];
+const tempFilesToCleanup: string[] = [];
 
 // ANSI escape codes
 const BG_BLACK = "\x1b[40m";
@@ -19,6 +21,31 @@ function getTerminalWidth(): number {
 // Strip ANSI codes to get visible length
 function stripAnsi(str: string): string {
   return str.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+// Download image from URL to temp file
+async function downloadImage(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download image: ${response.status} ${response.statusText}`);
+  }
+
+  const contentType = response.headers.get("content-type");
+  if (!contentType || !contentType.startsWith("image/")) {
+    throw new Error(`URL does not point to an image (content-type: ${contentType})`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  // Create temp file
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-show-image-"));
+  const ext = contentType.split("/")[1] || "png";
+  const tempPath = join(tempDir, `image.${ext}`);
+
+  await writeFile(tempPath, buffer);
+  tempFilesToCleanup.push(tempPath);
+
+  return tempPath;
 }
 
 // Center an image output with black background
@@ -72,6 +99,16 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // Cleanup temp files
+    for (const tempPath of tempFilesToCleanup) {
+      try {
+        await unlink(tempPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+    tempFilesToCleanup.length = 0;
+
     // Clear the queue
     pendingImages.length = 0;
   });
@@ -79,23 +116,46 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "show_image",
     label: "Show Image",
-    description: "Queue an image to be displayed in the terminal after the assistant finishes its current message. Image will be centered with a black background filling the full terminal width. Uses kitty image protocol (works in kitty, wezterm, ghostty, etc.)",
+    description: "Queue an image to be displayed in the terminal after the assistant finishes its current message. Accepts either a local file path or a URL. Image will be centered with a black background filling the full terminal width. Uses kitty image protocol (works in kitty, wezterm, ghostty, etc.)",
     parameters: Type.Object({
-      path: Type.String({
-        description: "Absolute or relative path to the image file to display",
-      }),
+      path: Type.Optional(Type.String({
+        description: "Absolute or relative path to a local image file to display",
+      })),
+      url: Type.Optional(Type.String({
+        description: "URL of an image to download and display",
+      })),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { path: imagePath } = params as { path: string };
-      const absolutePath = resolve(ctx.cwd, imagePath);
+      const { path: imagePath, url: imageUrl } = params as { path?: string; url?: string };
 
-      // Validate the file exists
-      try {
-        await readFile(absolutePath);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        throw new Error(`Cannot read image at ${absolutePath}: ${errorMessage}`);
+      if (!imagePath && !imageUrl) {
+        throw new Error("Either 'path' or 'url' must be provided");
+      }
+
+      let absolutePath: string;
+
+      if (imageUrl) {
+        // Download from URL
+        try {
+          absolutePath = await downloadImage(imageUrl);
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          throw new Error(`Failed to download image from URL: ${errorMessage}`);
+        }
+      } else if (imagePath) {
+        // Use local file
+        absolutePath = resolve(ctx.cwd, imagePath);
+
+        // Validate the file exists
+        try {
+          await readFile(absolutePath);
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          throw new Error(`Cannot read image at ${absolutePath}: ${errorMessage}`);
+        }
+      } else {
+        throw new Error("Either 'path' or 'url' must be provided");
       }
 
       // Queue for display at the end of the current assistant message
@@ -104,7 +164,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [],
         details: {
-          path: absolutePath,
+          source: imageUrl || absolutePath,
           queued: true,
         },
       };
