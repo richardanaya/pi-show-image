@@ -1,13 +1,17 @@
 import { Type } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import terminalImage from "terminal-image";
-import { readFile, writeFile, mkdtemp, unlink } from "node:fs/promises";
-import { resolve, join } from "node:path";
-import { tmpdir } from "node:os";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 
 // Store pending images to display after the next assistant message completes
-const pendingImages: string[] = [];
-const tempFilesToCleanup: string[] = [];
+interface PendingImage {
+  source: string; // path or URL for reference
+  data: Buffer | string; // Buffer for URLs, string (path) for local files
+  isBuffer: boolean;
+}
+
+const pendingImages: PendingImage[] = [];
 
 // ANSI escape codes
 const BG_BLACK = "\x1b[40m";
@@ -23,37 +27,16 @@ function stripAnsi(str: string): string {
   return str.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
-// Download image from URL to temp file
-async function downloadImage(url: string): Promise<string> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to download image: ${response.status} ${response.statusText}`);
-  }
-
-  const contentType = response.headers.get("content-type");
-  if (!contentType || !contentType.startsWith("image/")) {
-    throw new Error(`URL does not point to an image (content-type: ${contentType})`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-
-  // Create temp file
-  const tempDir = await mkdtemp(join(tmpdir(), "pi-show-image-"));
-  const ext = contentType.split("/")[1] || "png";
-  const tempPath = join(tempDir, `image.${ext}`);
-
-  await writeFile(tempPath, buffer);
-  tempFilesToCleanup.push(tempPath);
-
-  return tempPath;
-}
-
 // Center an image output with black background
-async function displayCenteredWithBackground(imagePath: string): Promise<void> {
+async function displayCenteredWithBackground(image: PendingImage): Promise<void> {
   const termWidth = getTerminalWidth();
 
+  // Get image buffer
+  const imageBuffer = image.isBuffer
+    ? image.data as Buffer
+    : await readFile(image.data as string);
+
   // Generate image at full terminal width
-  const imageBuffer = await readFile(imagePath);
   const imageOutput = await terminalImage.buffer(imageBuffer, {
     width: termWidth,
     height: "100%",
@@ -91,23 +74,13 @@ export default function (pi: ExtensionAPI) {
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     // Display all queued images centered with black background
-    for (const imagePath of pendingImages) {
+    for (const image of pendingImages) {
       try {
-        await displayCenteredWithBackground(imagePath);
+        await displayCenteredWithBackground(image);
       } catch (error) {
-        console.error(`Failed to display image ${imagePath}:`, error);
+        console.error(`Failed to display image ${image.source}:`, error);
       }
     }
-
-    // Cleanup temp files
-    for (const tempPath of tempFilesToCleanup) {
-      try {
-        await unlink(tempPath);
-      } catch {
-        // Ignore cleanup errors
-      }
-    }
-    tempFilesToCleanup.length = 0;
 
     // Clear the queue
     pendingImages.length = 0;
@@ -133,19 +106,30 @@ export default function (pi: ExtensionAPI) {
         throw new Error("Either 'path' or 'url' must be provided");
       }
 
-      let absolutePath: string;
+      let pendingImage: PendingImage;
 
       if (imageUrl) {
-        // Download from URL
-        try {
-          absolutePath = await downloadImage(imageUrl);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          throw new Error(`Failed to download image from URL: ${errorMessage}`);
+        // Download from URL to buffer (no temp file)
+        const response = await fetch(imageUrl);
+        if (!response.ok) {
+          throw new Error(`Failed to download image: ${response.status} ${response.statusText}`);
         }
+
+        const contentType = response.headers.get("content-type");
+        if (!contentType || !contentType.startsWith("image/")) {
+          throw new Error(`URL does not point to an image (content-type: ${contentType})`);
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+
+        pendingImage = {
+          source: imageUrl,
+          data: buffer,
+          isBuffer: true,
+        };
       } else if (imagePath) {
-        // Use local file
-        absolutePath = resolve(ctx.cwd, imagePath);
+        // Use local file path (read lazily at display time)
+        const absolutePath = resolve(ctx.cwd, imagePath);
 
         // Validate the file exists
         try {
@@ -154,17 +138,23 @@ export default function (pi: ExtensionAPI) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           throw new Error(`Cannot read image at ${absolutePath}: ${errorMessage}`);
         }
+
+        pendingImage = {
+          source: absolutePath,
+          data: absolutePath,
+          isBuffer: false,
+        };
       } else {
         throw new Error("Either 'path' or 'url' must be provided");
       }
 
       // Queue for display at the end of the current assistant message
-      pendingImages.push(absolutePath);
+      pendingImages.push(pendingImage);
 
       return {
         content: [],
         details: {
-          source: imageUrl || absolutePath,
+          source: pendingImage.source,
           queued: true,
         },
       };
