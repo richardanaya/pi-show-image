@@ -1,0 +1,20 @@
+{
+  "name": "pi-show-image",
+  "version": "0.0.0",
+  "description": "A pi extension to display images in the terminal using kitty image protocol",
+  "license": "MIT",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.ts",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "terminal-image": "^3.0.1"
+  }
+}
